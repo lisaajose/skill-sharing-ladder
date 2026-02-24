@@ -36,109 +36,127 @@ function readCurrentUser(): User | null {
 }
 
 export function useAuth() {
-  const [users, setUsers] = useState<User[]>(() => readUsers());
-  const [current, setCurrent] = useState<User | null>(() => readCurrentUser());
+  const [current, setCurrent] = useState<User | null>(null);
+  const [token, setToken] = useState<string | null>(() => localStorage.getItem("token"));
+  const [loading, setLoading] = useState(true);
 
-  useEffect(() => { writeUsers(users); }, [users]);
-
+  // When token changes, fetch user profile
   useEffect(() => {
-    const refresh = () => {
-      setUsers(readUsers());
-      setCurrent(readCurrentUser());
-    };
-    // cross-tab + intra-app notifications
-    const onStorage = (e: StorageEvent) => {
-      if (!e.key || e.key === USERS_KEY || e.key === CURRENT_USER_KEY) refresh();
-    };
-    window.addEventListener("storage", onStorage);
-    window.addEventListener("auth:changed" as any, refresh as any);
-    return () => {
-      window.removeEventListener("storage", onStorage);
-      window.removeEventListener("auth:changed" as any, refresh as any);
-    };
-  }, []);
+    if (token) {
+      localStorage.setItem("token", token);
+      fetchProfile(token);
+    } else {
+      localStorage.removeItem("token");
+      setCurrent(null);
+      setLoading(false);
+    }
+  }, [token]);
+
+  async function fetchProfile(authToken: string) {
+    try {
+      // Decode the token payload manually, since backend doesn't have an auth/me endpoint
+      // Alternatively, we could fetch `/api/users/${userId}` if we extract userId from token
+      const base64Url = authToken.split('.')[1];
+      const base64 = base64Url.replace(/-/g, '+').replace(/_/g, '/');
+      const jsonPayload = decodeURIComponent(atob(base64).split('').map(function (c) {
+        return '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2);
+      }).join(''));
+
+      const decoded = JSON.parse(jsonPayload);
+      const userId = decoded.user?.id || decoded.userId || decoded.id;
+
+      if (!userId) {
+        throw new Error("Invalid token structure");
+      }
+
+      const res = await fetch(`/api/users/${userId}`, {
+        headers: { "Authorization": `Bearer ${authToken}` }
+      });
+
+      if (!res.ok) throw new Error("Failed to fetch profile");
+      const data = await res.json();
+      setCurrent({
+        id: String(data.user_id),
+        name: data.username,
+        email: data.email,
+        campus: data.campus || '',
+        avatarUrl: data.avatarUrl || '',
+        passwordHash: "",
+        createdAt: data.created_at || new Date().toISOString()
+      });
+    } catch (e) {
+      console.error(e);
+      setToken(null);
+    } finally {
+      setLoading(false);
+    }
+  }
 
   async function signUp(name: string, email: string, password: string, campus?: string) {
-    const exists = readUsers().some((u) => u.email === email);
-    if (exists) throw new Error("Email already registered");
-    const passwordHash = await sha256(password);
-    const user: User = { id: crypto.randomUUID(), name, email, campus, passwordHash, createdAt: new Date().toISOString() };
-    const next = [user, ...readUsers()];
-    writeUsers(next);
-    writeCurrentUserEmail(email);
-    setUsers(next);
-    setCurrent(user);
-    window.dispatchEvent(new Event("auth:changed"));
-    return user;
+    const res = await fetch("/api/auth/register", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username: name, email, password })
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.message || "Failed to sign up");
+
+    // Auto login after sign up if backend returns token
+    if (data.token) {
+      setToken(data.token);
+    }
+
+    return data;
   }
 
   async function signIn(email: string, password: string) {
-    const passwordHash = await sha256(password);
-    const list = readUsers();
-    const user = list.find((u) => u.email === email && u.passwordHash === passwordHash);
-    if (!user) throw new Error("Invalid credentials");
-    writeCurrentUserEmail(email);
-    setUsers(list);
-    setCurrent(user);
-    window.dispatchEvent(new Event("auth:changed"));
-    return user;
+    const res = await fetch("/api/auth/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email, password })
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.message || "Invalid credentials");
+
+    if (data.token) {
+      setToken(data.token);
+      return data;
+    } else {
+      throw new Error("No token returned from server");
+    }
   }
 
   async function updateProfile(updates: Partial<Pick<User, "name" | "email" | "campus" | "avatarUrl">>) {
-    const curr = readCurrentUser();
-    if (!curr) throw new Error("Not signed in");
-    const list = readUsers();
-    const nextEmail = updates.email?.trim() || curr.email;
-    if (nextEmail !== curr.email && list.some((u) => u.email === nextEmail)) {
-      throw new Error("Email already in use");
-    }
-    const updated: User = {
-      ...curr,
-      name: updates.name?.trim() || curr.name,
-      email: nextEmail,
-      campus: updates.campus === undefined ? curr.campus : updates.campus,
-      avatarUrl: updates.avatarUrl === undefined ? curr.avatarUrl : updates.avatarUrl,
-    };
-    const nextList = list.map((u) => (u.id === curr.id ? updated : u));
-    writeUsers(nextList);
-    writeCurrentUserEmail(updated.email);
-    setUsers(nextList);
-    setCurrent(updated);
-    window.dispatchEvent(new Event("auth:changed"));
-    return updated;
+    if (!current || !token) throw new Error("Not signed in");
+    const res = await fetch(`/api/users/${current.id}`, {
+      method: "PUT",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${token}`
+      },
+      body: JSON.stringify({
+        username: updates.name,
+        email: updates.email,
+        campus: updates.campus
+      })
+    });
+    if (!res.ok) throw new Error("Failed to update profile");
+    fetchProfile(token); // refresh profile state
+    return current;
   }
 
   async function changePassword(newPassword: string) {
-    if (newPassword.length < 6) throw new Error("Password too short");
-    const curr = readCurrentUser();
-    if (!curr) throw new Error("Not signed in");
-    const list = readUsers();
-    const passwordHash = await sha256(newPassword);
-    const updated: User = { ...curr, passwordHash };
-    const nextList = list.map((u) => (u.id === curr.id ? updated : u));
-    writeUsers(nextList);
-    setUsers(nextList);
-    setCurrent(updated);
-    window.dispatchEvent(new Event("auth:changed"));
+    throw new Error("Change password is not implemented on the backend yet");
   }
 
   function signOut() {
-    writeCurrentUserEmail(null);
-    setCurrent(null);
-    window.dispatchEvent(new Event("auth:changed"));
+    setToken(null);
   }
 
   function deleteAccount() {
-    const curr = readCurrentUser();
-    if (!curr) throw new Error("Not signed in");
-    const list = readUsers();
-    const next = list.filter((u) => u.id !== curr.id);
-    writeUsers(next);
-    writeCurrentUserEmail(null);
-    setUsers(next);
-    setCurrent(null);
-    window.dispatchEvent(new Event("auth:changed"));
+    signOut();
+    throw new Error("Delete account is not implemented on the backend yet");
   }
 
-  return { users, current, signUp, signIn, signOut, deleteAccount, updateProfile, changePassword };
+  return { users: [], current, signUp, signIn, signOut, deleteAccount, updateProfile, changePassword, loading };
 }
